@@ -1,4 +1,16 @@
 # wujian@2018
+"""
+Conv-TasNet 模型定义。
+
+职责：
+1. 定义编码器、时域分离主干和解码器；
+2. 提供 Conv-TasNet 训练与推理时统一的前向逻辑；
+3. 封装本项目使用的归一化层、1D 卷积封装和重复卷积块。
+
+核心输入输出：
+- 输入：单通道混合语音，`Tensor[S]` 或 `Tensor[N, S]`
+- 输出：说话人分离结果列表，`List[Tensor[N, S']]`
+"""
 
 import torch as th
 import torch.nn as nn
@@ -8,7 +20,14 @@ import torch.nn.functional as F
 
 def param(nnet, Mb=True):
     """
-    Return number parameters(not bytes) in nnet
+    统计模型参数量。
+
+    输入：
+    - nnet: 任意 `nn.Module`
+    - Mb: 为 True 时返回百万参数量，否则返回参数总个数
+
+    输出：
+    - float 或 int
     """
     neles = sum([param.nelement() for param in nnet.parameters()])
     return neles / 10**6 if Mb else neles
@@ -16,7 +35,13 @@ def param(nnet, Mb=True):
 
 class ChannelWiseLayerNorm(nn.LayerNorm):
     """
-    Channel wise layer normalization
+    按通道做 LayerNorm。
+
+    输入：
+    - `x`: `Tensor[N, C, T]`
+
+    输出：
+    - `Tensor[N, C, T]`
     """
 
     def __init__(self, *args, **kwargs):
@@ -24,7 +49,7 @@ class ChannelWiseLayerNorm(nn.LayerNorm):
 
     def forward(self, x):
         """
-        x: N x C x T
+        前向输入输出形状均为 `N x C x T`。
         """
         if x.dim() != 3:
             raise RuntimeError("{} accept 3D tensor as input".format(
@@ -40,7 +65,15 @@ class ChannelWiseLayerNorm(nn.LayerNorm):
 
 class GlobalChannelLayerNorm(nn.Module):
     """
-    Global channel layer normalization
+    全局通道归一化。
+
+    会在每条样本的 `(C, T)` 全部位置上统计均值和方差。
+
+    输入：
+    - `x`: `Tensor[N, C, T]`
+
+    输出：
+    - `Tensor[N, C, T]`
     """
 
     def __init__(self, dim, eps=1e-05, elementwise_affine=True):
@@ -57,7 +90,7 @@ class GlobalChannelLayerNorm(nn.Module):
 
     def forward(self, x):
         """
-        x: N x C x T
+        前向输入输出形状均为 `N x C x T`。
         """
         if x.dim() != 3:
             raise RuntimeError("{} accept 3D tensor as input".format(
@@ -79,8 +112,14 @@ class GlobalChannelLayerNorm(nn.Module):
 
 def build_norm(norm, dim):
     """
-    Build normalize layer
-    LN cost more memory than BN
+    根据名称构造归一化层。
+
+    输入：
+    - norm: `"cLN"` / `"gLN"` / `"BN"`
+    - dim: 通道数
+
+    输出：
+    - 对应的归一化层实例
     """
     if norm not in ["cLN", "gLN", "BN"]:
         raise RuntimeError("Unsupported normalize layer: {}".format(norm))
@@ -94,7 +133,15 @@ def build_norm(norm, dim):
 
 class Conv1D(nn.Conv1d):
     """
-    1D conv in ConvTasNet
+    对 `nn.Conv1d` 的轻量封装。
+
+    兼容两种输入：
+    - `Tensor[N, L]`
+    - `Tensor[N, C, L]`
+
+    输出：
+    - 默认返回三维张量
+    - `squeeze=True` 时去掉单通道维
     """
 
     def __init__(self, *args, **kwargs):
@@ -102,7 +149,8 @@ class Conv1D(nn.Conv1d):
 
     def forward(self, x, squeeze=False):
         """
-        x: N x L or N x C x L
+        输入形状：
+        - `N x L` 或 `N x C x L`
         """
         if x.dim() not in [2, 3]:
             raise RuntimeError("{} accept 2/3D tensor as input".format(
@@ -115,7 +163,13 @@ class Conv1D(nn.Conv1d):
 
 class ConvTrans1D(nn.ConvTranspose1d):
     """
-    1D conv transpose in ConvTasNet
+    对 `nn.ConvTranspose1d` 的轻量封装。
+
+    输入：
+    - `Tensor[N, L]` 或 `Tensor[N, C, L]`
+
+    输出：
+    - 反卷积后的时域序列
     """
 
     def __init__(self, *args, **kwargs):
@@ -123,7 +177,8 @@ class ConvTrans1D(nn.ConvTranspose1d):
 
     def forward(self, x, squeeze=False):
         """
-        x: N x L or N x C x L
+        输入形状：
+        - `N x L` 或 `N x C x L`
         """
         if x.dim() not in [2, 3]:
             raise RuntimeError("{} accept 2/3D tensor as input".format(
@@ -136,8 +191,15 @@ class ConvTrans1D(nn.ConvTranspose1d):
 
 class Conv1DBlock(nn.Module):
     """
-    1D convolutional block:
-        Conv1x1 - PReLU - Norm - DConv - PReLU - Norm - SConv
+    Conv-TasNet 中的基础卷积块。
+
+    结构：
+    `1x1 Conv -> PReLU -> Norm -> Depthwise Dilated Conv
+     -> PReLU -> Norm -> 1x1 Conv -> Residual Add`
+
+    输入输出：
+    - 输入：`Tensor[N, B, T]`
+    - 输出：`Tensor[N, B, T]`
     """
 
     def __init__(self,
@@ -184,6 +246,22 @@ class Conv1DBlock(nn.Module):
 
 
 class ConvTasNet(nn.Module):
+    """
+    Conv-TasNet 主模型。
+
+    流程：
+    1. 编码器把混合波形变成时域特征；
+    2. TCN 风格的重复卷积块估计每个说话人的 mask；
+    3. 用 mask 作用在编码特征上；
+    4. 解码器把每路特征还原成波形。
+
+    输入：
+    - `Tensor[S]` 或 `Tensor[N, S]`
+
+    输出：
+    - `List[Tensor[N, S']]`，列表长度等于 `num_spks`
+    """
+
     def __init__(self,
                  L=20,
                  N=256,
@@ -240,7 +318,7 @@ class ConvTasNet(nn.Module):
 
     def _build_blocks(self, num_blocks, **block_kwargs):
         """
-        Build Conv1D block
+        构造一组不同 dilation 的卷积块。
         """
         blocks = [
             Conv1DBlock(**block_kwargs, dilation=(2**b))
@@ -250,7 +328,7 @@ class ConvTasNet(nn.Module):
 
     def _build_repeats(self, num_repeats, num_blocks, **block_kwargs):
         """
-        Build Conv1D block repeats
+        构造重复堆叠的卷积块主干。
         """
         repeats = [
             self._build_blocks(num_blocks, **block_kwargs)
@@ -259,6 +337,16 @@ class ConvTasNet(nn.Module):
         return nn.Sequential(*repeats)
 
     def forward(self, x):
+        """
+        Conv-TasNet 前向传播。
+
+        输入：
+        - `x`: `Tensor[S]` 或 `Tensor[N, S]`
+
+        输出：
+        - `List[Tensor[N, S']]`
+        - 每个元素对应一路分离出来的说话人波形
+        """
         if x.dim() >= 3:
             raise RuntimeError(
                 "{} accept 1/2D tensor as input, but got {:d}".format(
@@ -266,21 +354,28 @@ class ConvTasNet(nn.Module):
         # when inference, only one utt
         if x.dim() == 1:
             x = th.unsqueeze(x, 0)
+        # 编码阶段：把时域波形映射到可学习的基底表示。
         # n x 1 x S => n x N x T
         w = F.relu(self.encoder_1d(x))
+        # 归一化并投影到 bottleneck 通道。
         # n x B x T
         y = self.proj(self.ln(w))
+        # 分离主干：堆叠的时域卷积块负责建模说话人上下文。
         # n x B x T
         y = self.repeats(y)
+        # 掩码估计：为每位说话人预测一份编码域 mask。
         # n x 2N x T
         e = th.chunk(self.mask(y), self.num_spks, 1)
+        # 根据配置选择激活函数，得到真正的 mask。
         # n x N x T
         if self.non_linear_type == "softmax":
             m = self.non_linear(th.stack(e, dim=0), dim=0)
         else:
             m = self.non_linear(th.stack(e, dim=0))
+        # 将每位说话人的 mask 作用到共享编码特征上。
         # spks x [n x N x T]
         s = [w * m[n] for n in range(self.num_spks)]
+        # 解码阶段：把每一路编码特征还原回时域波形。
         # spks x n x S
         return [self.decoder_1d(x, squeeze=True) for x in s]
 

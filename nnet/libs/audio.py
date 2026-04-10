@@ -1,4 +1,14 @@
 # wujian@2018
+"""
+音频读写与 scp 解析工具。
+
+职责：
+1. 读写 wav 文件；
+2. 解析 Kaldi 风格的 `*.scp`；
+3. 提供通用 Reader 和专用于波形读取的 WaveReader。
+
+这些工具是数据加载、推理导出和评估脚本的基础。
+"""
 
 import os
 import numpy as np
@@ -9,7 +19,16 @@ MAX_INT16 = np.iinfo(np.int16).max
 
 def write_wav(fname, samps, fs=16000, normalize=True):
     """
-    Write wav files in int16, support single/multi-channel
+    将波形写成 int16 wav 文件。
+
+    输入：
+    - fname: 输出路径
+    - samps: `np.ndarray[S]` 或多通道波形
+    - fs: 采样率
+    - normalize: 是否按 int16 范围缩放
+
+    输出：
+    - 无显式返回值，文件写入磁盘
     """
     if normalize:
         samps = samps * MAX_INT16
@@ -30,14 +49,23 @@ def write_wav(fname, samps, fs=16000, normalize=True):
 
 def read_wav(fname, normalize=True, return_rate=False):
     """
-    Read wave files using scipy.io.wavfile(support multi-channel)
+    读取 wav 文件。
+
+    输入：
+    - fname: wav 路径
+    - normalize: 是否归一化到 `[-1, 1]`
+    - return_rate: 是否同时返回采样率
+
+    输出：
+    - `np.ndarray[S]` 或 `np.ndarray[C, S]`
+    - 当 `return_rate=True` 时返回 `(sample_rate, samps)`
     """
     # samps_int16: N x C or N
     #   N: number of samples
     #   C: number of channels
     samp_rate, samps_int16 = wf.read(fname)
     # N x C => C x N
-    samps = samps_int16.astype(np.float)
+    samps = samps_int16.astype(np.float32)
     # tranpose because I used to put channel axis first
     if samps.ndim != 1:
         samps = np.transpose(samps)
@@ -51,8 +79,15 @@ def read_wav(fname, normalize=True, return_rate=False):
 
 def parse_scripts(scp_path, value_processor=lambda x: x, num_tokens=2):
     """
-    Parse kaldi's script(.scp) file
-    If num_tokens >= 2, function will check token number
+    解析 Kaldi 风格的脚本文件。
+
+    输入：
+    - scp_path: 脚本路径
+    - value_processor: 对 value 做后处理的函数
+    - num_tokens: 每行期望的 token 数
+
+    输出：
+    - `dict[key, value]`
     """
     scp_dict = dict()
     line = 0
@@ -78,7 +113,14 @@ def parse_scripts(scp_path, value_processor=lambda x: x, num_tokens=2):
 
 class Reader(object):
     """
-        Basic Reader Class
+    通用脚本读取器。
+
+    输入：
+    - scp_path: Kaldi 风格脚本文件
+
+    输出：
+    - 支持按 key、按索引和按顺序读取
+    - 默认 `_load()` 直接返回脚本中的 value
     """
 
     def __init__(self, scp_path, value_processor=lambda x: x):
@@ -122,10 +164,15 @@ class Reader(object):
 
 class WaveReader(Reader):
     """
-        Sequential/Random Reader for single channel wave
-        Format of wav.scp follows Kaldi's definition:
-            key1 /path/to/wav
-            ...
+    基于 wav.scp 的波形读取器。
+
+    输入：
+    - wav_scp: `key path/to/audio.wav` 格式的 scp
+    - sample_rate: 可选，若给定则强制校验采样率
+    - normalize: 是否归一化波形幅值
+
+    输出：
+    - `__getitem__` / `__iter__` 返回对应 key 的波形数组
     """
 
     def __init__(self, wav_scp, sample_rate=None, normalize=True):
@@ -134,6 +181,13 @@ class WaveReader(Reader):
         self.normalize = normalize
 
     def _load(self, key):
+        """
+        按 key 读取一条波形，并做采样率校验。
+
+        输出：
+        - 单通道时为 `np.ndarray[S]`
+        - 多通道时为 `np.ndarray[C, S]`
+        """
         # return C x N or N
         samp_rate, samps = read_wav(
             self.index_dict[key], normalize=self.normalize, return_rate=True)

@@ -1,6 +1,12 @@
 # wujian@2018
 """
-SI-SNR(scale-invariant SNR/SDR) measure of speech separation
+评估指标工具。
+
+职责：
+1. 计算单条语音之间的 SI-SNR；
+2. 在多说话人场景下枚举排列，返回最佳匹配下的平均 SI-SNR。
+
+该文件主要被 `compute_si_snr.py` 调用。
 """
 
 import numpy as np
@@ -10,10 +16,15 @@ from itertools import permutations
 
 def si_snr(x, s, remove_dc=True):
     """
-    Compute SI-SNR
-    Arguments:
-        x: vector, enhanced/separated signal
-        s: vector, reference signal(ground truth)
+    计算单条分离语音与参考语音之间的 SI-SNR。
+
+    输入：
+    - x: `np.ndarray[S]`，分离或增强后的语音
+    - s: `np.ndarray[S]`，参考语音
+    - remove_dc: 是否先做去均值
+
+    输出：
+    - float，当前这一对语音的 SI-SNR
     """
 
     def vec_l2norm(x):
@@ -33,10 +44,14 @@ def si_snr(x, s, remove_dc=True):
 
 def permute_si_snr(xlist, slist):
     """
-    Compute SI-SNR between N pairs
-    Arguments:
-        x: list[vector], enhanced/separated signal
-        s: list[vector], reference signal(ground truth)
+    多说话人版本的 SI-SNR。
+
+    输入：
+    - xlist: `List[np.ndarray]`，模型输出的多路分离语音
+    - slist: `List[np.ndarray]`，参考语音列表
+
+    输出：
+    - float，所有说话人排列中最佳匹配下的平均 SI-SNR
     """
 
     def si_snr_avg(xlist, slist):

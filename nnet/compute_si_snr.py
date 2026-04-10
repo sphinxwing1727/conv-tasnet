@@ -2,7 +2,13 @@
 
 # wujian@2018
 """
-Compute SI-SDR as the evaluation metric
+评估入口脚本，用于统计分离结果的 SI-SNR / SI-SDR 表现。
+
+职责：
+1. 读取分离结果和参考语音对应的 scp；
+2. 支持单说话人与多说话人两种评估模式；
+3. 多说话人场景下自动做 permutation matching；
+4. 按整体或性别分组输出平均指标。
 """
 
 import argparse
@@ -15,6 +21,17 @@ from libs.audio import WaveReader, Reader
 
 
 class SpeakersReader(object):
+    """
+    多说话人结果读取器。
+
+    输入：
+    - scps: 逗号分隔的多个 scp 路径，例如 `spk1.scp,spk2.scp`
+
+    输出：
+    - `__getitem__` / `__iter__` 返回 `List[np.ndarray]`
+    - 列表中的每个元素对应一位说话人的波形
+    """
+
     def __init__(self, scps):
         split_scps = scps.split(",")
         if len(split_scps) == 1:
@@ -37,6 +54,16 @@ class SpeakersReader(object):
 
 
 class Report(object):
+    """
+    简单的指标累加器。
+
+    输入：
+    - `add(key, val)` 中的 key 是 utterance id，val 是该条语音的 SI-SNR
+
+    输出：
+    - `report()` 将打印按性别或整体聚合后的平均分数
+    """
+
     def __init__(self, spk2gender=None):
         self.s2g = Reader(spk2gender) if spk2gender else None
         self.snr = defaultdict(float)
@@ -59,6 +86,18 @@ class Report(object):
 
 
 def run(args):
+    """
+    根据命令行参数完成评估。
+
+    输入：
+    - args.sep_scp: 分离结果 scp，支持单个或逗号分隔的多个 scp
+    - args.ref_scp: 参考语音 scp，格式与 sep_scp 对齐
+    - args.spk2gender: 可选，说话人性别映射
+
+    输出：
+    - 无显式返回值
+    - 指标通过标准输出打印
+    """
     single_speaker = len(args.sep_scp.split(",")) == 1
     reporter = Report(args.spk2gender)
 

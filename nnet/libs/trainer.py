@@ -1,4 +1,14 @@
 # wujian@2018
+"""
+训练框架与 SI-SNR/PIT 损失实现。
+
+职责：
+1. 提供通用 Trainer，负责训练、验证、学习率调度和 checkpoint；
+2. 定义 `SiSnrTrainer`，实现 Conv-TasNet 训练所需的 PIT + SI-SNR loss；
+3. 约定训练 batch 的输入格式，并将其送入模型和损失函数。
+
+本文件是训练链路中最靠近“优化目标”的一层。
+"""
 
 import os
 import sys
@@ -11,13 +21,24 @@ import torch as th
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.nn.utils import clip_grad_norm_
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
 
 from .utils import get_logger
 
 
 def load_obj(obj, device):
     """
-    Offload tensor object in obj to cuda device
+    递归地把 batch 中的 Tensor 移动到目标设备。
+
+    输入：
+    - obj: Tensor / list / dict 的嵌套结构
+    - device: 目标设备
+
+    输出：
+    - 与输入同结构、但 Tensor 已搬到设备上的对象
     """
 
     def cuda(obj):
@@ -33,7 +54,7 @@ def load_obj(obj, device):
 
 class SimpleTimer(object):
     """
-    A simple timer
+    训练日志使用的简易计时器。
     """
 
     def __init__(self):
@@ -48,22 +69,25 @@ class SimpleTimer(object):
 
 class ProgressReporter(object):
     """
-    A simple progress reporter
+    批级损失统计器。
+
+    输出：
+    - `report()` 返回 `{"loss": float, "batches": int, "cost": float}`
     """
 
     def __init__(self, logger, period=100):
         self.period = period
         self.logger = logger
-        self.loss = []
+        self.loss = []  # batch数为索引
         self.timer = SimpleTimer()
 
-    def add(self, loss):
+    def add(self, loss):  # 返回每个周期批次内的批次损失均值
         self.loss.append(loss)
         N = len(self.loss)
         if not N % self.period:
             avg = sum(self.loss[-self.period:]) / self.period
-            self.logger.info("Processed {:d} batches"
-                             "(loss = {:+.2f})...".format(N, avg))
+            self.logger.info("Processed {:d} batches with period{:d}"
+                             "(loss = {:+.2f})...".format(N, self.period, avg))
 
     def report(self, details=False):
         N = len(self.loss)
@@ -78,6 +102,15 @@ class ProgressReporter(object):
 
 
 class Trainer(object):
+    """
+    通用训练器基类。
+
+    职责：
+    - 管理模型、优化器、学习率调度器和 checkpoint；
+    - 约定 `compute_loss()` 由子类实现；
+    - 提供 train/eval/run 三个主要训练阶段接口。
+    """
+
     def __init__(self,
                  nnet,
                  checkpoint="checkpoint",
@@ -91,6 +124,16 @@ class Trainer(object):
                  logging_period=100,
                  resume=None,
                  no_impr=6):
+        """
+        输入：
+        - nnet: 待训练模型
+        - checkpoint: 模型和日志输出目录
+        - gpuid: 单卡或多卡设备 id
+        - optimizer_kwargs: 优化器参数字典
+
+        输出：
+        - 初始化完成的 Trainer 实例
+        """
         if not th.cuda.is_available():
             raise RuntimeError("CUDA device unavailable...exist")
         if not isinstance(gpuid, tuple):
@@ -102,11 +145,15 @@ class Trainer(object):
         self.checkpoint = checkpoint
         self.logger = get_logger(
             os.path.join(checkpoint, "trainer.log"), file=True)
+        self.tensorboard_dir = os.path.join(checkpoint, "tensorboard")
+        self.tb_writer = SummaryWriter(
+            log_dir=self.tensorboard_dir) if SummaryWriter else None
 
         self.clip_norm = clip_norm
         self.logging_period = logging_period
         self.cur_epoch = 0  # zero based
         self.no_impr = no_impr
+        self.train_step = 0
 
         if resume:
             if not os.path.exists(resume):
@@ -114,6 +161,7 @@ class Trainer(object):
                     "Could not find resume checkpoint: {}".format(resume))
             cpt = th.load(resume, map_location="cpu")
             self.cur_epoch = cpt["epoch"]
+            self.train_step = cpt.get("train_step", 0)
             self.logger.info("Resume from checkpoint {}: epoch {:d}".format(
                 resume, self.cur_epoch))
             # load nnet
@@ -129,8 +177,7 @@ class Trainer(object):
             mode="min",
             factor=factor,
             patience=patience,
-            min_lr=min_lr,
-            verbose=True)
+            min_lr=min_lr)
         self.num_params = sum(
             [param.nelement() for param in nnet.parameters()]) / 10.0**6
 
@@ -138,13 +185,25 @@ class Trainer(object):
         self.logger.info("Model summary:\n{}".format(nnet))
         self.logger.info("Loading model to GPUs:{}, #param: {:.2f}M".format(
             gpuid, self.num_params))
+        if self.tb_writer:
+            self.logger.info("TensorBoard logs will be written to {}".format(
+                self.tensorboard_dir))
+        else:
+            self.logger.info("TensorBoard is unavailable; skipping curve logs")
         if clip_norm:
             self.logger.info(
                 "Gradient clipping by {}, default L2".format(clip_norm))
 
     def save_checkpoint(self, best=True):
+        """
+        保存当前 epoch 的模型和优化器状态。
+
+        输出：
+        - `best.pt.tar` 或 `last.pt.tar`
+        """
         cpt = {
             "epoch": self.cur_epoch,
+            "train_step": self.train_step,
             "model_state_dict": self.nnet.state_dict(),
             "optim_state_dict": self.optimizer.state_dict()
         }
@@ -154,6 +213,12 @@ class Trainer(object):
                          "{0}.pt.tar".format("best" if best else "last")))
 
     def create_optimizer(self, optimizer, kwargs, state=None):
+        """
+        根据名称创建优化器，可选恢复历史状态。
+
+        输出：
+        - `torch.optim.Optimizer` 实例
+        """
         supported_optimizer = {
             "sgd": th.optim.SGD,  # momentum, weight_decay, lr
             "rmsprop": th.optim.RMSprop,  # momentum, weight_decay, lr
@@ -173,9 +238,28 @@ class Trainer(object):
         return opt
 
     def compute_loss(self, egs):
+        """
+        由子类实现的损失函数接口。
+
+        输入：
+        - egs: 一个 batch，约定结构为
+          `{"mix": Tensor[N, S], "ref": List[Tensor[N, S]]}`
+
+        输出：
+        - 标量 loss Tensor
+        """
         raise NotImplementedError
 
     def train(self, data_loader):
+        """
+        执行一个训练 epoch。
+
+        输入：
+        - data_loader: 迭代返回 batch 的数据加载器
+
+        输出：
+        - `{"loss": float, "batches": int, "cost": float}`
+        """
         self.logger.info("Set train mode...")
         self.nnet.train()
         reporter = ProgressReporter(self.logger, period=self.logging_period)
@@ -191,10 +275,23 @@ class Trainer(object):
                 clip_grad_norm_(self.nnet.parameters(), self.clip_norm)
             self.optimizer.step()
 
-            reporter.add(loss.item())
+            loss_value = loss.item()
+            reporter.add(loss_value)
+            self.train_step += 1
+            if self.tb_writer:
+                self.tb_writer.add_scalar("loss/train_batch", loss_value,
+                                          self.train_step)
+                if not self.train_step % self.logging_period:
+                    self.tb_writer.flush()
         return reporter.report()
 
     def eval(self, data_loader):
+        """
+        执行一个验证 epoch，不做反向传播。
+
+        输出：
+        - `{"loss": float, "batches": int, "cost": float}`
+        """
         self.logger.info("Set eval mode...")
         self.nnet.eval()
         reporter = ProgressReporter(self.logger, period=self.logging_period)
@@ -207,13 +304,33 @@ class Trainer(object):
         return reporter.report(details=True)
 
     def run(self, train_loader, dev_loader, num_epochs=50):
+        """
+        驱动完整训练流程。
+
+        输入：
+        - train_loader: 训练集数据加载器
+        - dev_loader: 验证集数据加载器
+        - num_epochs: 训练轮数上限
+
+        输出：
+        - 无显式返回值
+        - 训练过程中持续刷新日志、学习率与 checkpoint
+        """
         # avoid alloc memory from gpu0
         with th.cuda.device(self.gpuid[0]):
             stats = dict()
+            start_epoch = self.cur_epoch
             # check if save is OK
             self.save_checkpoint(best=False)
             cv = self.eval(dev_loader)
             best_loss = cv["loss"]
+            if self.tb_writer:
+                self.tb_writer.add_scalar("loss/dev_epoch", best_loss,
+                                          self.cur_epoch)
+                self.tb_writer.add_scalar("lr/epoch",
+                                          self.optimizer.param_groups[0]["lr"],
+                                          self.cur_epoch)
+                self.tb_writer.flush()
             self.logger.info("START FROM EPOCH {:d}, LOSS = {:.4f}".format(
                 self.cur_epoch, best_loss))
             no_impr = 0
@@ -231,6 +348,14 @@ class Trainer(object):
                 cv = self.eval(dev_loader)
                 stats["cv"] = "dev = {:+.4f}({:.2f}m/{:d})".format(
                     cv["loss"], cv["cost"], cv["batches"])
+                if self.tb_writer:
+                    self.tb_writer.add_scalar("loss/train_epoch", tr["loss"],
+                                              self.cur_epoch)
+                    self.tb_writer.add_scalar("loss/dev_epoch", cv["loss"],
+                                              self.cur_epoch)
+                    self.tb_writer.add_scalar("lr/epoch", cur_lr,
+                                              self.cur_epoch)
+                    self.tb_writer.flush()
                 stats["scheduler"] = ""
                 if cv["loss"] > best_loss:
                     no_impr += 1
@@ -253,21 +378,40 @@ class Trainer(object):
                         "Stop training cause no impr for {:d} epochs".format(
                             no_impr))
                     break
-            self.logger.info("Training for {:d}/{:d} epoches done!".format(
-                self.cur_epoch, num_epochs))
+            ran_epochs = self.cur_epoch - start_epoch
+            if self.cur_epoch < num_epochs:
+                self.logger.info(
+                    "Training stopped early after {:d} epochs in this run (current epoch: {:d})."
+                    .format(ran_epochs, self.cur_epoch))
+            else:
+                self.logger.info(
+                    "Training completed after {:d} epochs in this run (current epoch: {:d})."
+                    .format(ran_epochs, self.cur_epoch))
+            if self.tb_writer:
+                self.tb_writer.close()
 
 
 class SiSnrTrainer(Trainer):
+    """
+    使用 SI-SNR 作为目标函数的训练器。
+
+    该类在 `compute_loss()` 中实现了 permutation invariant training:
+    会枚举说话人排列，并选择当前 batch 中每条样本的最佳匹配。
+    """
+
     def __init__(self, *args, **kwargs):
         super(SiSnrTrainer, self).__init__(*args, **kwargs)
 
     def sisnr(self, x, s, eps=1e-8):
         """
-        Arguments:
-        x: separated signal, N x S tensor
-        s: reference signal, N x S tensor
-        Return:
-        sisnr: N tensor
+        计算 batch 内每条样本的 SI-SNR。
+
+        输入：
+        - x: `Tensor[N, S]`，模型输出的一路分离语音
+        - s: `Tensor[N, S]`，对应参考语音
+
+        输出：
+        - `Tensor[N]`，batch 内每条样本各自的 SI-SNR
         """
 
         def l2norm(mat, keepdim=False):
@@ -285,6 +429,20 @@ class SiSnrTrainer(Trainer):
         return 20 * th.log10(eps + l2norm(t) / (l2norm(x_zm - t) + eps))
 
     def compute_loss(self, egs):
+        """
+        计算 PIT + SI-SNR 损失。
+
+        输入：
+        - `egs["mix"]`: `Tensor[N, S]`
+        - `egs["ref"]`: `List[Tensor[N, S]]`
+
+        中间结果：
+        - `ests`: `List[Tensor[N, S]]`，模型输出的多路分离结果
+        - `sisnr_mat`: `Tensor[num_permutations, N]`
+
+        输出：
+        - 标量 loss Tensor，数值等于最佳排列下平均 SI-SNR 的相反数
+        """
         # spks x n x S
         ests = th.nn.parallel.data_parallel(
             self.nnet, egs["mix"], device_ids=self.gpuid)
@@ -293,7 +451,8 @@ class SiSnrTrainer(Trainer):
         num_spks = len(refs)
 
         def sisnr_loss(permute):
-            # for one permute
+            # for one permute所以在你这段代码里，如果 permute=(0,1)，那么 for s, 
+            # t in enumerate(permute) 就会依次取到：s=0, t=0s=1t=1
             return sum(
                 [self.sisnr(ests[s], refs[t])
                  for s, t in enumerate(permute)]) / len(permute)

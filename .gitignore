@@ -1,7 +1,26 @@
 .vscode/
+
+# Python cache / tooling
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+
+# Logs / arrays
 *.log
+*.npy
+
+# Local experiment scripts
 egs.py
 egs/
 nnet/compute_encoder.py
-*.npy
+
+# Training / inference outputs
+/checkpoint*/
+/exp/
+/sep/
+/wave_compare/
+/waveform_compare/
+/runs/
