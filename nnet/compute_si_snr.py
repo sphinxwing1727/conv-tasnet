@@ -17,40 +17,7 @@ from tqdm import tqdm
 
 from collections import defaultdict
 from libs.metric import si_snr, permute_si_snr
-from libs.audio import WaveReader, Reader
-
-
-class SpeakersReader(object):
-    """
-    多说话人结果读取器。
-
-    输入：
-    - scps: 逗号分隔的多个 scp 路径，例如 `spk1.scp,spk2.scp`
-
-    输出：
-    - `__getitem__` / `__iter__` 返回 `List[np.ndarray]`
-    - 列表中的每个元素对应一位说话人的波形
-    """
-
-    def __init__(self, scps):
-        split_scps = scps.split(",")
-        if len(split_scps) == 1:
-            raise RuntimeError(
-                "Construct SpeakersReader need more than one script, got {}".
-                format(scps))
-        self.readers = [WaveReader(scp) for scp in split_scps]
-
-    def __len__(self):
-        first_reader = self.readers[0]
-        return len(first_reader)
-
-    def __getitem__(self, key):
-        return [reader[key] for reader in self.readers]
-
-    def __iter__(self):
-        first_reader = self.readers[0]
-        for key in first_reader.index_keys:
-            yield key, self[key]
+from libs.audio import WaveReader, SpeakersReader, Reader
 
 
 class Report(object):
@@ -73,6 +40,7 @@ class Report(object):
         gender = "NG"
         if self.s2g:
             gender = self.s2g[key]
+        # defaultdict 会自动初始化不存在的 key，所以这里不需要判断 gender 是否在 self.snr 中
         self.snr[gender] += val
         self.cnt[gender] += 1
 

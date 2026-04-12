@@ -11,6 +11,9 @@ coverage.xml
 # Logs / arrays
 *.log
 *.npy
+*.png
+*.jpg
+*.svg
 
 # Local experiment scripts
 egs.py

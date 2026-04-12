@@ -5,7 +5,7 @@
 职责：
 1. 读写 wav 文件；
 2. 解析 Kaldi 风格的 `*.scp`；
-3. 提供通用 Reader 和专用于波形读取的 WaveReader。
+3. 提供通用 Reader、单路波形 WaveReader 和多路波形 SpeakersReader。
 
 这些工具是数据加载、推理导出和评估脚本的基础。
 """
@@ -196,3 +196,94 @@ class WaveReader(Reader):
             raise RuntimeError("SampleRate mismatch: {:d} vs {:d}".format(
                 samp_rate, self.samp_rate))
         return samps
+
+
+class SpeakersReader(object):
+    """
+    多说话人波形读取器。
+
+    作用：
+        把多个用逗号分隔的 wav.scp 文件包装成一个统一 reader，例如
+        "spk1.scp,spk2.scp"。读取同一个 key 时，会从每一路 scp 中各取一条
+        波形，组成列表返回。
+    输入：
+        scps: 逗号分隔的 wav.scp 路径字符串，每个 scp 对应一个说话人/输出流。
+        sample_rate: 可选采样率；传入后会交给每个 WaveReader 做采样率校验。
+        normalize: 是否归一化波形幅值；会传给每个 WaveReader。
+    输出：
+        索引或迭代时返回同一个 key 下的多路波形列表。
+    调用时机：
+        compute_si_snr.py 和 plot_waveform_compare.py 检测到多路 scp 输入时调用。
+    """
+
+    def __init__(self, scps, sample_rate=None, normalize=True):
+        """
+        初始化多个 WaveReader。
+
+        作用：
+            将逗号分隔的 scp 路径拆开，并为每个 scp 创建一个 WaveReader。
+        输入：
+            scps: 多个 scp 路径组成的字符串，路径之间用逗号分隔。
+            sample_rate: 可选采样率校验值。
+            normalize: 是否归一化波形幅值。
+        输出：
+            无返回值；会把各路 WaveReader 保存到 self.readers。
+        调用时机：
+            创建 SpeakersReader(scps) 实例时自动调用。
+        """
+        split_scps = scps.split(",")
+        if len(split_scps) == 1:
+            raise RuntimeError(
+                "Construct SpeakersReader need more than one script, got {}".
+                format(scps))
+        self.readers = [
+            WaveReader(scp, sample_rate=sample_rate, normalize=normalize)
+            for scp in split_scps
+        ]
+
+    def __len__(self):
+        """
+        返回可读取的样本数量。
+
+        作用：
+            用第一路 scp 的长度作为多路 reader 的长度。
+        输入：
+            无显式输入；使用 self.readers[0]。
+        输出：
+            int，第一路 WaveReader 中的 utterance 数量。
+        调用时机：
+            外部调用 len(SpeakersReader 实例) 时触发。
+        """
+        return len(self.readers[0])
+
+    def __getitem__(self, key):
+        """
+        按 utterance key 读取多路波形。
+
+        作用：
+            在每一路 WaveReader 中取同一个 key 的波形，拼成列表返回。
+        输入：
+            key: utterance 的标识，例如 scp 文件第一列中的 id。
+        输出：
+            list，形如 [spk1_wave, spk2_wave, ...] 的多路 numpy 波形数组。
+        调用时机：
+            代码执行 self[key]、ref_reader[key] 或迭代器内部取样本时触发。
+        """
+        return [reader[key] for reader in self.readers]
+
+    def __iter__(self):
+        """
+        逐条迭代多路波形。
+
+        作用：
+            按第一路 scp 的 key 顺序，依次 yield 每个 key 及其多路波形列表。
+        输入：
+            无显式输入；使用第一路 WaveReader 的 index_keys。
+        输出：
+            迭代产生 (key, waves)，其中 waves 是多路波形列表。
+        调用时机：
+            run() 中执行 for key, sep in tqdm(sep_reader) 时触发。
+        """
+        first_reader = self.readers[0]
+        for key in first_reader.index_keys:
+            yield key, self[key]
