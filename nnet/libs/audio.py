@@ -60,18 +60,27 @@ def read_wav(fname, normalize=True, return_rate=False):
     - `np.ndarray[S]` 或 `np.ndarray[C, S]`
     - 当 `return_rate=True` 时返回 `(sample_rate, samps)`
     """
-    # samps_int16: N x C or N
+    # samps_raw: N x C or N
     #   N: number of samples
     #   C: number of channels
-    samp_rate, samps_int16 = wf.read(fname)
+    samp_rate, samps_raw = wf.read(fname)
     # N x C => C x N
-    samps = samps_int16.astype(np.float32)
+    samps = samps_raw.astype(np.float32)
     # tranpose because I used to put channel axis first
     if samps.ndim != 1:
         samps = np.transpose(samps)
-    # normalize like MATLAB and librosa
+    # Normalize by the actual integer full-scale value instead of always
+    # assuming int16. Float WAVs are already expected to be in a reasonable
+    # range, so keep them as-is.
     if normalize:
-        samps = samps / MAX_INT16
+        if np.issubdtype(samps_raw.dtype, np.integer):
+            scale = float(
+                max(abs(np.iinfo(samps_raw.dtype).min),
+                    np.iinfo(samps_raw.dtype).max))
+            samps = samps / scale
+        elif not np.issubdtype(samps_raw.dtype, np.floating):
+            raise TypeError("Unsupported WAV dtype: {}".format(
+                samps_raw.dtype))
     if return_rate:
         return samp_rate, samps
     return samps

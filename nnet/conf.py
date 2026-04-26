@@ -15,10 +15,19 @@
 - `trainer_conf`: 优化器和调度器配置
 """
 
+from pathlib import Path
+
 fs = 8000
 chunk_len = 4  # (s)
 chunk_size = chunk_len * fs
 num_spks = 2
+
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+DATA_ROOT = WORKSPACE_ROOT / "OpenSLR" / "data_for_convtasnet" / "aishell_musan_8k_seg4_shared_snr0_10"
+
+
+def _subset_dir(name):
+    return str((DATA_ROOT / name).resolve()) + "/"
 
 # 模型结构相关配置，会透传给 `ConvTasNet(**nnet_conf)`。
 nnet_conf = {
@@ -35,8 +44,8 @@ nnet_conf = {
 }
 
 # 训练/验证数据位置，默认使用 Kaldi 风格的 wav scp。
-train_dir = "../data/aishell_musan_8k_seg4_shared_snr0_10/train/"
-dev_dir = "../data/aishell_musan_8k_seg4_shared_snr0_10/dev/"
+train_dir = _subset_dir("train")
+dev_dir = _subset_dir("dev")
 
 train_data = {
     "mix_scp":
